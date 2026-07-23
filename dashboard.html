@@ -1,0 +1,531 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SpendGuard</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wght@500;600;700;800&family=JetBrains+Mono:wght@500;700&display=swap" rel="stylesheet">
+<style>
+  :root{--bg:#14171C;--panel:#1C2128;--panel-hi:#232A32;--ink:#E6E9EE;--muted:#8A93A2;
+    --faint:#5A6472;--line:#2A313B;--safe:#35C2A6;--warn:#F2B44A;--trip:#F4553D;
+    --shadow:0 1px 0 rgba(255,255,255,.03),0 10px 30px rgba(0,0,0,.4);}
+  *{box-sizing:border-box}
+  html,body{margin:0;background:var(--bg);color:var(--ink);
+    font-family:"Archivo",system-ui,sans-serif;-webkit-font-smoothing:antialiased}
+  body{min-height:100vh;
+    background-image:linear-gradient(var(--line) 1px,transparent 1px),linear-gradient(90deg,var(--line) 1px,transparent 1px);
+    background-size:46px 46px,46px 46px}
+  body::before{content:"";position:fixed;inset:0;pointer-events:none;
+    background:radial-gradient(120% 80% at 50% -10%,rgba(53,194,166,.055),transparent 60%)}
+  .wrap{max-width:880px;margin:0 auto;padding:34px 22px 60px;position:relative}
+
+  /* ---------- header ---------- */
+  header{display:flex;align-items:center;justify-content:space-between;gap:14px;
+    padding-bottom:16px;border-bottom:1px solid var(--line)}
+  .brand h1{font-size:19px;font-weight:800;letter-spacing:.15em;margin:0;text-transform:uppercase}
+  .brand h1 span{color:var(--safe)}
+  .brand p{margin:3px 0 0;color:var(--muted);font-size:12.5px}
+  .modeswitch{display:flex;border:1px solid var(--line);border-radius:3px;overflow:hidden;background:var(--panel)}
+  .modeswitch button{border:none;background:transparent;color:var(--muted);padding:9px 14px;
+    font-size:11.5px;font-weight:700;letter-spacing:.12em;text-transform:uppercase;cursor:pointer}
+  .modeswitch button.on{background:var(--trip);color:#fff}
+  .modeswitch button.on.shadowon{background:var(--warn);color:#12161A}
+
+  /* ---------- meter ---------- */
+  .meter{margin-top:20px;background:var(--panel);border:1px solid var(--line);border-radius:5px;
+    box-shadow:var(--shadow);padding:24px 26px 20px;position:relative;overflow:hidden}
+  .row1{display:flex;align-items:baseline;justify-content:space-between;gap:16px;flex-wrap:wrap}
+  .amount{font-family:"JetBrains Mono",monospace;font-variant-numeric:tabular-nums;font-weight:700;
+    font-size:clamp(38px,7vw,62px);line-height:1;letter-spacing:-.02em}
+  .amount.warn{color:var(--warn)}.amount.trip{color:var(--trip)}
+  .right{text-align:right;color:var(--muted);font-size:13px}
+  .right b{color:var(--ink);font-family:"JetBrains Mono",monospace}
+  .state{display:inline-flex;align-items:center;gap:8px;margin-top:5px;font-size:11.5px;
+    font-weight:700;letter-spacing:.14em;text-transform:uppercase;color:var(--safe)}
+  .state .led{width:8px;height:8px;border-radius:50%;background:var(--safe);animation:pulse 2.4s infinite}
+  .state.tripped{color:var(--trip)}
+  .state.tripped .led{background:var(--trip);animation:none;box-shadow:0 0 10px rgba(244,85,61,.8)}
+  @keyframes pulse{0%{box-shadow:0 0 0 0 rgba(53,194,166,.5)}70%{box-shadow:0 0 0 6px rgba(53,194,166,0)}100%{box-shadow:0 0 0 0 rgba(53,194,166,0)}}
+  .gauge{position:relative;margin-top:16px;height:20px;border-radius:3px;background:var(--panel-hi);
+    border:1px solid var(--line);box-shadow:inset 0 2px 6px rgba(0,0,0,.5)}
+  .fill{position:absolute;top:0;left:0;bottom:0;width:0%;border-radius:2px 0 0 2px;background:var(--safe);
+    transition:width .35s cubic-bezier(.2,.7,.3,1),background .4s}
+  .fill.warn{background:var(--warn)}.fill.trip{background:var(--trip)}
+  .cap{position:absolute;top:-1px;bottom:-1px;right:0;width:2px;background:var(--trip);opacity:.6}
+  .stamp{position:absolute;top:18px;right:24px;transform:rotate(-9deg);border:2.5px solid var(--trip);
+    color:var(--trip);border-radius:4px;padding:6px 12px;font-weight:800;letter-spacing:.2em;
+    font-size:13px;text-transform:uppercase;opacity:0;pointer-events:none}
+  .stamp.show{animation:st .45s cubic-bezier(.2,1.3,.4,1) forwards}
+  @keyframes st{from{opacity:0;transform:rotate(-9deg) scale(1.5)}to{opacity:.9;transform:rotate(-9deg) scale(1)}}
+
+  /* ---------- shadow report ---------- */
+  .shadow{margin-top:14px;display:none;border:1px solid var(--warn);border-radius:5px;
+    background:linear-gradient(180deg,rgba(242,180,74,.08),rgba(242,180,74,.02));padding:15px 20px}
+  .shadow.show{display:flex;gap:34px;flex-wrap:wrap;align-items:baseline}
+  .shadow .k{color:var(--warn);font-size:10.5px;letter-spacing:.14em;text-transform:uppercase;font-weight:700}
+  .shadow .v{font-family:"JetBrains Mono",monospace;font-weight:700;font-size:26px;margin-top:3px}
+  .shadow .note{color:var(--faint);font-size:12px;line-height:1.5;max-width:300px}
+
+  /* ---------- cards ---------- */
+  .card{margin-top:14px;background:var(--panel);border:1px solid var(--line);border-radius:5px;box-shadow:var(--shadow)}
+  .card>h2{margin:0;padding:13px 18px;font-size:10.5px;letter-spacing:.18em;text-transform:uppercase;
+    color:var(--muted);font-weight:700;border-bottom:1px solid var(--line)}
+  details>summary{list-style:none;cursor:pointer;padding:13px 18px;font-size:10.5px;letter-spacing:.18em;
+    text-transform:uppercase;color:var(--muted);font-weight:700;display:flex;align-items:center;gap:9px}
+  details>summary::-webkit-details-marker{display:none}
+  details>summary::before{content:"▸";color:var(--faint);font-size:12px;transition:transform .15s}
+  details[open]>summary::before{transform:rotate(90deg)}
+  details[open]>summary{border-bottom:1px solid var(--line)}
+  summary .sum{margin-left:auto;color:var(--faint);font-size:11px;letter-spacing:.02em;text-transform:none;font-weight:500}
+
+  /* ---------- form ---------- */
+  .fields{padding:16px 18px;display:grid;grid-template-columns:1fr 1fr;gap:13px}
+  @media(max-width:620px){.fields{grid-template-columns:1fr}}
+  .f{display:flex;flex-direction:column;gap:5px}
+  .f.full{grid-column:1/-1}
+  .f label{color:var(--muted);font-size:10.5px;letter-spacing:.11em;text-transform:uppercase;font-weight:700}
+  input,select,textarea{background:var(--panel-hi);border:1px solid var(--line);color:var(--ink);
+    border-radius:3px;padding:10px 11px;font-family:"JetBrains Mono",monospace;font-size:13px;width:100%}
+  textarea{min-height:64px;resize:vertical}
+  input:focus,select:focus,textarea:focus{outline:none;border-color:var(--muted)}
+  .hint{color:var(--faint);font-size:11.5px;line-height:1.45}
+
+  /* ---------- defence rows ---------- */
+  .def{display:flex;align-items:center;gap:14px;padding:13px 18px;border-bottom:1px solid rgba(42,49,59,.6)}
+  .def:last-child{border-bottom:none}
+  .def .nm{min-width:150px}
+  .def .nm b{display:block;font-size:13.5px;font-weight:700}
+  .def .nm span{display:block;color:var(--faint);font-size:11.5px;margin-top:2px;line-height:1.35}
+  .def .ctl{margin-left:auto;display:flex;gap:8px;align-items:center;min-width:0}
+  .def .ctl input,.def .ctl select{width:auto;min-width:120px;padding:8px 10px;font-size:12.5px}
+  .def.off .nm b,.def.off .nm span{opacity:.45}
+  .def.off .ctl{opacity:.35;pointer-events:none}
+  .def.always .nm b::after{content:"always on";margin-left:8px;color:var(--safe);font-size:10px;
+    letter-spacing:.1em;text-transform:uppercase;font-weight:700}
+  /* toggle */
+  .sw{position:relative;width:38px;height:21px;flex:none;cursor:pointer}
+  .sw input{position:absolute;opacity:0;width:0;height:0}
+  .sw i{position:absolute;inset:0;background:var(--panel-hi);border:1px solid var(--line);
+    border-radius:11px;transition:.18s}
+  .sw i::after{content:"";position:absolute;top:2px;left:2px;width:15px;height:15px;border-radius:50%;
+    background:var(--faint);transition:.18s}
+  .sw input:checked+i{background:rgba(53,194,166,.22);border-color:var(--safe)}
+  .sw input:checked+i::after{transform:translateX(17px);background:var(--safe)}
+  .sw.fixed{opacity:.6;pointer-events:none}
+
+  /* ---------- buttons ---------- */
+  button.b{font-family:inherit;font-weight:700;letter-spacing:.02em;cursor:pointer;border-radius:3px;
+    padding:10px 16px;font-size:13px;transition:.15s;border:1px solid}
+  .primary{background:var(--safe);border-color:var(--safe);color:#0B1512}
+  .primary:hover{filter:brightness(1.08)}
+  .ghost{background:transparent;border-color:var(--line);color:var(--muted)}
+  .ghost:hover{border-color:var(--muted);color:var(--ink)}
+  button.b:disabled{background:var(--panel);border-color:var(--line);color:var(--faint);cursor:not-allowed;filter:none}
+  .runrow{padding:14px 18px;display:flex;gap:9px;align-items:center;flex-wrap:wrap}
+  .runrow .spacer{flex:1}
+  .runrow .demolbl{color:var(--faint);font-size:11.5px}
+  .saved{color:var(--safe);font-size:12px;font-weight:700;opacity:0;transition:.2s}
+  .saved.show{opacity:1}
+
+  /* ---------- activity ---------- */
+  .strip{display:flex;gap:7px;flex-wrap:wrap;padding:12px 18px;border-bottom:1px solid var(--line)}
+  .pill{background:var(--panel-hi);border:1px solid var(--line);border-radius:3px;padding:5px 9px;
+    font-size:11.5px;color:var(--muted);display:flex;gap:6px;align-items:center}
+  .pill b{font-family:"JetBrains Mono",monospace;color:var(--ink);font-weight:700}
+  .pill.hot b{color:var(--trip)}.pill.good b{color:var(--safe)}.pill.warnp b{color:var(--warn)}
+  .feed{max-height:270px;overflow:auto;padding:6px 0}
+  .r{display:flex;gap:9px;align-items:baseline;padding:7px 18px;font-size:13px;
+    border-bottom:1px solid rgba(42,49,59,.45);animation:in .22s ease}
+  @keyframes in{from{opacity:0;transform:translateY(-3px)}to{opacity:1}}
+  .r .m{font-family:"JetBrains Mono",monospace;font-weight:700;flex:none;width:16px}
+  .r .t{word-break:break-word}
+  .r .n{margin-left:auto;font-family:"JetBrains Mono",monospace;color:var(--muted);
+    font-variant-numeric:tabular-nums;flex:none;font-size:12px}
+  .r.ok .m{color:var(--safe)}
+  .r.kill .m,.r.kill .t{color:var(--trip)}
+  .r.warn .m,.r.warn .t{color:var(--warn)}
+  .r.dim .m,.r.dim .t{color:var(--faint)}
+  .empty{padding:20px 18px;color:var(--faint);font-size:12.5px}
+
+  .banner{margin-top:14px;border:1px solid var(--trip);border-radius:5px;padding:16px 20px;display:none;
+    background:linear-gradient(180deg,rgba(244,85,61,.09),rgba(244,85,61,.02))}
+  .banner.show{display:block;animation:in .3s ease}
+  .banner.y{border-color:var(--warn);background:linear-gradient(180deg,rgba(242,180,74,.09),rgba(242,180,74,.02))}
+  .banner.g{border-color:var(--safe);background:linear-gradient(180deg,rgba(53,194,166,.09),rgba(53,194,166,.02))}
+  .banner .bt{font-weight:800;letter-spacing:.04em;font-size:14.5px;color:var(--trip);text-transform:uppercase}
+  .banner.y .bt{color:var(--warn)}.banner.g .bt{color:var(--safe)}
+  .banner .bd{margin-top:7px;color:var(--muted);font-size:13.5px;line-height:1.5}
+  .banner .bd b{color:var(--ink);font-family:"JetBrains Mono",monospace}
+
+  .connect{padding:15px 18px}
+  .connect .u{display:flex;align-items:center;gap:9px;flex-wrap:wrap}
+  .connect code{font-family:"JetBrains Mono",monospace;color:var(--safe);background:var(--panel-hi);
+    border:1px solid var(--line);border-radius:3px;padding:8px 11px;font-size:12.5px}
+  .connect pre{margin:11px 0 0;background:var(--panel-hi);border:1px solid var(--line);border-radius:3px;
+    padding:12px;overflow:auto;font-family:"JetBrains Mono",monospace;font-size:12px;color:var(--muted);line-height:1.6}
+  .connect pre b{color:var(--safe)}
+  @media(prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <header>
+    <div class="brand"><h1>Spend<span>Guard</span></h1><p>Spend firewall for autonomous agents</p></div>
+    <div class="modeswitch">
+      <button id="mEnforce" class="on">Enforce</button>
+      <button id="mShadow">Shadow</button>
+    </div>
+  </header>
+
+  <!-- METER -->
+  <div class="meter">
+    <div class="row1">
+      <div>
+        <div class="amount" id="amount">$0.0000</div>
+        <div class="state" id="state"><span class="led"></span><span id="stateText">Armed</span></div>
+      </div>
+      <div class="right">spent of <b id="limit">$0.0000</b><br><span id="upstreamLbl" style="font-size:11.5px;color:var(--faint)"></span></div>
+    </div>
+    <div class="gauge"><div class="fill" id="fill"></div><div class="cap"></div></div>
+    <div class="stamp" id="stamp">Tripped</div>
+  </div>
+
+  <div class="shadow" id="shadowBox">
+    <div><div class="k">Would have blocked</div><div class="v" id="shWould">0</div></div>
+    <div><div class="k">Would have saved</div><div class="v" id="shSaved" style="color:var(--safe)">$0.0000</div></div>
+    <div class="note">Nothing is being blocked. These are real measurements &mdash; the cost of calls that only went through because enforcement is off.</div>
+  </div>
+
+  <!-- SETUP -->
+  <details class="card" id="setupBox" open>
+    <summary>Provider <span class="sum" id="setupSum"></span></summary>
+    <div class="fields">
+      <div class="f">
+        <label for="provider">Provider</label>
+        <select id="provider">
+          <option value="openai">OpenAI</option>
+          <option value="groq">Groq</option>
+          <option value="anthropic">Anthropic</option>
+          <option value="ollama">Ollama (local)</option>
+          <option value="custom">Custom URL…</option>
+        </select>
+      </div>
+      <div class="f">
+        <label for="model">Model</label>
+        <input id="model" type="text" value="gpt-4o-mini">
+      </div>
+      <div class="f full" id="upstreamWrap" style="display:none">
+        <label for="upstream">Base URL</label>
+        <input id="upstream" type="text" placeholder="https://api.example.com/v1">
+      </div>
+      <div class="f">
+        <label for="apikey">API key</label>
+        <input id="apikey" type="password" placeholder="paste your provider key">
+      </div>
+      <div class="f">
+        <label for="budget">Budget (USD)</label>
+        <input id="budget" type="number" min="0.0001" step="0.001" value="0.02">
+      </div>
+      <div class="f full"><span class="hint">Your key stays in this local app's memory, is forwarded to the provider, and is never written to disk.</span></div>
+    </div>
+  </details>
+
+  <!-- DEFENCES -->
+  <div class="card">
+    <h2>Defences</h2>
+
+    <div class="def always">
+      <span class="sw fixed"><input type="checkbox" checked disabled><i></i></span>
+      <div class="nm"><b>Spend cap</b><span>Refuses or cuts calls at the budget line</span></div>
+      <div class="ctl"><span style="color:var(--faint);font-size:12px" id="capEcho">$0.0000</span></div>
+    </div>
+
+    <div class="def off" id="rowLoop">
+      <label class="sw"><input type="checkbox" id="swLoop"><i></i></label>
+      <div class="nm"><b>Loop detection</b><span>Breaks a <code style="font-family:inherit">while True</code> agent repeating one prompt</span></div>
+      <div class="ctl">
+        <select id="loopThreshold">
+          <option value="2">after 2</option>
+          <option value="3" selected>after 3</option>
+          <option value="5">after 5</option>
+        </select>
+      </div>
+    </div>
+
+    <div class="def off" id="rowQuality">
+      <label class="sw"><input type="checkbox" id="swQuality"><i></i></label>
+      <div class="nm"><b>Quality rule</b><span>Stops paying an agent that keeps failing</span></div>
+      <div class="ctl">
+        <select id="qmode">
+          <option value="json">valid JSON</option>
+          <option value="schema">JSON schema…</option>
+        </select>
+        <input id="fallbackModel" type="text" placeholder="fallback model (optional)">
+      </div>
+    </div>
+    <div class="f full" id="schemaWrap" style="display:none;padding:0 18px 14px">
+      <label for="schema" style="margin-bottom:5px;display:block">JSON schema</label>
+      <textarea id="schema">{"type":"object","required":["name","value"],"properties":{"name":{"type":"string"},"value":{"type":"number"}}}</textarea>
+    </div>
+
+    <div class="def off" id="rowTools">
+      <label class="sw"><input type="checkbox" id="swTools"><i></i></label>
+      <div class="nm"><b>Action firewall</b><span>Discards forbidden tool calls before they run</span></div>
+      <div class="ctl"><input id="blockedTools" type="text" placeholder="delete_*, drop_*, refund" style="min-width:190px"></div>
+    </div>
+
+    <div class="def off" id="rowConsensus">
+      <label class="sw"><input type="checkbox" id="swConsensus"><i></i></label>
+      <div class="nm"><b>Consensus</b><span>Two models must agree before an action runs</span></div>
+      <div class="ctl"><input id="consensusModel" type="text" placeholder="second model" style="min-width:170px"></div>
+    </div>
+
+    <div class="runrow" style="border-top:1px solid var(--line)">
+      <button class="b primary" id="save">Save</button>
+      <span class="saved" id="savedMsg">Saved</span>
+    </div>
+  </div>
+
+  <!-- RUN -->
+  <div class="card">
+    <h2>Run</h2>
+    <div class="runrow">
+      <button class="b primary" id="runReal">Run real calls</button>
+      <button class="b ghost" id="stopBtn">Stop</button>
+      <button class="b ghost" id="reset">Reset</button>
+      <span class="spacer"></span>
+      <span class="demolbl">no key? try:</span>
+      <select id="demoSelect" style="width:auto;min-width:180px">
+        <option value="/demo/unleash">Runaway spend</option>
+        <option value="/demo/unleash_loop">Stuck in a loop</option>
+        <option value="/demo/unleash_quality">Failing output</option>
+        <option value="/demo/unleash_fallback">Rescued by fallback</option>
+        <option value="/demo/unleash_tools">Destructive action</option>
+      </select>
+      <button class="b ghost" id="runDemo">Run</button>
+    </div>
+  </div>
+
+  <!-- ACTIVITY -->
+  <div class="card">
+    <div class="strip">
+      <span class="pill">calls <b id="mCalls">0</b></span>
+      <span class="pill hot">refused <b id="mRefused">0</b></span>
+      <span class="pill hot">halted <b id="mHalted">0</b></span>
+      <span class="pill warnp">loops <b id="mLoops">0</b></span>
+      <span class="pill warnp">bad output <b id="mQFails">0</b></span>
+      <span class="pill good">rescued <b id="mSaves">0</b></span>
+      <span class="pill hot">actions blocked <b id="mTools">0</b></span>
+    </div>
+    <div class="feed" id="feed"><div class="empty">Idle. Save your provider, then run some calls &mdash; or try a scenario above.</div></div>
+  </div>
+
+  <div class="banner" id="banner"><div class="bt" id="bTitle"></div><div class="bd" id="bText"></div></div>
+
+  <details class="card">
+    <summary>Point your agent here <span class="sum" id="urlSum"></span></summary>
+    <div class="connect">
+      <div class="u"><code id="baseUrl">&mdash;</code><button class="b ghost" id="copyUrl" style="padding:8px 12px">Copy</button></div>
+      <pre id="snippet"></pre>
+    </div>
+  </details>
+
+</div>
+
+<script>
+(function(){
+  var $=function(i){return document.getElementById(i);};
+  var fmt=function(v){return "$"+Number(v).toFixed(4);};
+  var esc=function(s){var d=document.createElement("div");d.textContent=String(s==null?"":s);return d.innerHTML;};
+  var curLimit=0.02,cleared=false,running=false,mode="enforce";
+  var runBtns=[$("runReal"),$("runDemo")];
+
+  var origin=location.origin;
+  $("baseUrl").textContent=origin+"/v1";
+  $("urlSum").textContent=origin+"/v1";
+  $("snippet").innerHTML='from openai import OpenAI\n\nclient = OpenAI(\n    base_url=<b>"'+origin+'/v1"</b>,   # the only change\n    api_key="your-provider-key",\n)';
+  $("copyUrl").onclick=function(){try{navigator.clipboard.writeText(origin+"/v1");
+    $("copyUrl").textContent="Copied";setTimeout(function(){$("copyUrl").textContent="Copy";},1200);}catch(e){}};
+
+  // ---- toggles ----
+  function bind(sw,row){ $(sw).onchange=function(){ $(row).classList.toggle("off",!this.checked); }; }
+  bind("swLoop","rowLoop"); bind("swTools","rowTools"); bind("swConsensus","rowConsensus");
+  $("swQuality").onchange=function(){
+    $("rowQuality").classList.toggle("off",!this.checked);
+    $("schemaWrap").style.display=(this.checked&&$("qmode").value==="schema")?"block":"none";
+  };
+  $("qmode").onchange=function(){
+    $("schemaWrap").style.display=($("swQuality").checked&&this.value==="schema")?"block":"none";
+  };
+  $("provider").onchange=function(){
+    $("upstreamWrap").style.display=(this.value==="custom")?"flex":"none";
+    var m={openai:"gpt-4o-mini",groq:"llama-3.1-8b-instant",anthropic:"claude-sonnet-4-6",ollama:"llama3"};
+    if(m[this.value])$("model").value=m[this.value];
+  };
+
+  // ---- enforce / shadow ----
+  function setMode(m,push){
+    mode=m;
+    $("mEnforce").className=(m==="enforce")?"on":"";
+    $("mShadow").className=(m==="shadow")?"on shadowon":"";
+    $("shadowBox").classList.toggle("show",m==="shadow");
+    if(push)fetch("/config",{method:"POST",headers:{"content-type":"application/json"},
+      body:JSON.stringify({enforcement_mode:m,reset:false})}).catch(function(){});
+  }
+  $("mEnforce").onclick=function(){setMode("enforce",true);};
+  $("mShadow").onclick=function(){setMode("shadow",true);};
+
+  // ---- save ----
+  function policy(){
+    if(!$("swQuality").checked)return null;
+    if($("qmode").value==="json")return {type:"json"};
+    try{return {type:"json_schema",schema:JSON.parse($("schema").value)};}catch(e){return undefined;}
+  }
+  function save(cb){
+    var pol=policy();
+    if(pol===undefined){alert("The JSON schema isn't valid JSON.");return;}
+    var p={provider:$("provider").value,model:$("model").value.trim(),
+      budget_usd:parseFloat($("budget").value),check_policy:pol,trip_after:2,
+      enforcement_mode:mode,
+      loop_detection:$("swLoop").checked,loop_threshold:parseInt($("loopThreshold").value,10),
+      blocked_tools:$("swTools").checked?$("blockedTools").value.trim():"",
+      fallback_model:$("swQuality").checked?$("fallbackModel").value.trim():"",
+      consensus_model:$("swConsensus").checked?$("consensusModel").value.trim():"",
+      require_consensus:$("swConsensus").checked&&$("consensusModel").value.trim().length>0};
+    if($("provider").value==="custom")p.upstream=$("upstream").value.trim();
+    var k=$("apikey").value.trim(); if(k)p.api_key=k;
+    fetch("/config",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify(p)})
+      .then(function(r){return r.json();}).then(function(){
+        $("savedMsg").classList.add("show");
+        setTimeout(function(){$("savedMsg").classList.remove("show");},1400);
+        if(cb)cb();
+      }).catch(function(){});
+  }
+  $("save").onclick=function(){save();};
+
+  // ---- meter ----
+  function gauge(spent,limit){
+    var pct=Math.max(0,Math.min(100,(spent/limit)*100));
+    $("fill").style.width=pct+"%";
+    $("fill").className="fill"+(pct>=100?" trip":pct>=70?" warn":"");
+    $("amount").className="amount"+(pct>=100?" trip":pct>=70?" warn":"");
+  }
+  function trip(t){$("state").classList.add("tripped");$("stateText").textContent=t||"Tripped";$("stamp").classList.add("show");}
+  function row(cls,mark,txt,num){
+    if(!cleared){$("feed").innerHTML="";cleared=true;}
+    var e=document.createElement("div");e.className="r "+cls;
+    e.innerHTML='<span class="m">'+mark+'</span><span class="t">'+txt+'</span>'+(num?'<span class="n">'+esc(num)+'</span>':'');
+    $("feed").appendChild(e);$("feed").scrollTop=$("feed").scrollHeight;
+  }
+  function metrics(d){
+    var set=function(id,v){if(v!=null)$(id).textContent=v;};
+    set("mCalls",d.calls);set("mRefused",d.refused);set("mHalted",d.halted);
+    set("mLoops",d.loop_trips);set("mQFails",d.quality_fail_total);
+    set("mSaves",d.fallback_saves);set("mTools",d.tools_blocked_total);
+    set("shWould",d.shadow_would_block);
+    if(d.shadow_saved_usd!=null)$("shSaved").textContent=fmt(d.shadow_saved_usd);
+    if(d.limit_usd){curLimit=d.limit_usd;$("limit").textContent=fmt(d.limit_usd);$("capEcho").textContent=fmt(d.limit_usd);}
+  }
+  function endRun(){running=false;runBtns.forEach(function(b){b.disabled=false;});}
+  function clean(){
+    endRun();cleared=false;
+    $("feed").innerHTML='<div class="empty">Idle. Save your provider, then run some calls &mdash; or try a scenario above.</div>';
+    $("amount").textContent="$0.0000";gauge(0,curLimit);
+    $("state").classList.remove("tripped");$("stateText").textContent="Armed";
+    $("stamp").classList.remove("show");$("banner").className="banner";
+    ["mCalls","mRefused","mHalted","mLoops","mQFails","mSaves","mTools","shWould"].forEach(function(i){$(i).textContent="0";});
+  }
+  function banner(kind,title,html){
+    $("banner").className="banner show"+(kind?" "+kind:"");
+    $("bTitle").textContent=title;$("bText").innerHTML=html;
+  }
+
+  // ---- live events ----
+  var es=new EventSource("/events");
+  es.onmessage=function(e){
+    var d;try{d=JSON.parse(e.data);}catch(_){return;}
+    var lim=d.limit_usd||curLimit;
+    switch(d.kind){
+      case "stats":
+        metrics(d);$("amount").textContent=fmt(d.spent_usd||0);gauge(d.spent_usd||0,lim);
+        if(d.limit_usd)$("budget").value=d.limit_usd;
+        if(d.model)$("model").value=d.model;
+        if(d.upstream){$("upstreamLbl").textContent=d.upstream.replace(/^https?:\/\//,"");
+          $("setupSum").textContent=(d.model||"")+" · "+d.upstream.replace(/^https?:\/\//,"");}
+        if(d.enforcement_mode)setMode(d.enforcement_mode,false);
+        if(d.loop_enabled!=null){$("swLoop").checked=d.loop_enabled;$("rowLoop").classList.toggle("off",!d.loop_enabled);
+          if(d.loop_threshold)$("loopThreshold").value=String(d.loop_threshold);}
+        if(d.check_policy!==undefined){var on=!!d.check_policy;$("swQuality").checked=on;
+          $("rowQuality").classList.toggle("off",!on);}
+        if(d.fallback_model!=null)$("fallbackModel").value=d.fallback_model;
+        if(d.blocked_tools){var on2=d.blocked_tools.length>0;$("swTools").checked=on2;
+          $("rowTools").classList.toggle("off",!on2);$("blockedTools").value=d.blocked_tools.join(", ");}
+        if(d.consensus_model!=null){var on3=!!d.require_consensus;$("swConsensus").checked=on3;
+          $("rowConsensus").classList.toggle("off",!on3);$("consensusModel").value=d.consensus_model;}
+        break;
+      case "call_start": row("dim","&rarr;","call &mdash; "+esc(d.model),fmt(d.remaining_usd)+" left");break;
+      case "progress": $("amount").textContent=fmt(d.projected_spent_usd);gauge(d.projected_spent_usd,lim);break;
+      case "call_done": $("amount").textContent=fmt(d.spent_usd);gauge(d.spent_usd,lim);
+        if(!d.was_halted)row("ok","ok","call complete",fmt(d.cost_usd));metrics(d);break;
+      case "halt": gauge(lim,lim);row("kill","&#9632;","kill-switch &mdash; stream cut at "+d.output_tokens+" tok","capped");
+        metrics(d);trip("Tripped");break;
+      case "refused": row("kill","&#9940;","402 &mdash; refused before sending","0 tok");metrics(d);trip("Tripped");break;
+      case "loop_repeat": row("warn","&#8635;","identical prompt ("+d.count+"/"+d.loop_threshold+")","");break;
+      case "loop_detected": row("kill","&#9632;","429 &mdash; loop detected, identical prompt x"+d.count,"$0.0000");
+        metrics(d);trip("Loop broken");break;
+      case "loop_blocked": row("kill","&#9940;","429 &mdash; loop breaker open","0 tok");metrics(d);break;
+      case "quality_fail": row("warn","&#9888;","output failed check &mdash; "+esc(d.reason),"fail "+d.fails);metrics(d);break;
+      case "quality_trip": row("kill","&#9632;","quality breaker open","");metrics(d);trip("Quality trip");break;
+      case "quality_refused": row("kill","&#9940;","409 &mdash; quality breaker open","0 tok");metrics(d);break;
+      case "fallback_attempt": row("warn","&#8635;","retrying with "+esc(d.fallback_model),"");break;
+      case "fallback_success": row("ok","&#10003;","rescued by "+esc(d.fallback_model),"+"+fmt(d.cost_usd));metrics(d);break;
+      case "fallback_failed": row("kill","&#10007;","fallback also failed","");metrics(d);break;
+      case "tool_blocked": row("kill","&#128737;","403 &mdash; action blocked: "+esc(d.tool),"");metrics(d);trip("Action blocked");break;
+      case "consensus_start": row("dim","&#8646;","asking "+esc(d.consensus_model)+" in parallel","");break;
+      case "consensus_ok": row("ok","&#10003;","consensus passed &mdash; both models agreed","$"+Number(d.cost_usd).toFixed(4));metrics(d);break;
+      case "consensus_failed": row("kill","&#9632;","403 &mdash; consensus failed: "+esc(d.reason),"");metrics(d);trip("Consensus failed");break;
+      case "shadow_block": row("warn","&#128065;","shadow: would block ("+esc(d.defense)+")","observed");metrics(d);break;
+      case "upstream_error": row("kill","&#10007;","provider error "+esc(d.status)+" &mdash; "+esc(d.detail),"");metrics(d);break;
+      case "agent_error": row("kill","&#10007;",esc(d.detail),"");break;
+      case "loop_stopped":
+        metrics(d);endRun();
+        if(d.stopped_by==="budget")banner("","Bankruptcy prevented",
+          "The runaway loop was stopped by SpendGuard, not by an empty account. Budget <b>"+fmt(d.limit_usd)
+          +"</b> · spent <b>"+fmt(d.spent_usd)+"</b>, never exceeded.");
+        else if(d.stopped_by==="loop")banner("y","Loop detected",
+          "The agent kept sending the identical prompt. The circuit broke after <b>"+d.loop_threshold
+          +"</b> repeats — the call was never forwarded. Spent only <b>"+fmt(d.spent_usd)+"</b> of <b>"+fmt(d.limit_usd)+"</b>.");
+        else if(d.stopped_by==="quality")banner("y","Stopped paying the agent to fail",
+          "The agent kept producing invalid output. Cut off after <b>"+fmt(d.spent_usd)+"</b> of <b>"
+          +fmt(d.limit_usd)+"</b> — a plain cap would have let it burn the rest.");
+        else if(d.stopped_by==="tool")banner("","Destructive action discarded",
+          "The model asked to run a forbidden tool. <b>"+(d.tools_blocked_total||0)
+          +"</b> action(s) intercepted before reaching your executor.");
+        else if(d.fallback_saves>0)banner("g","Rescued, never crashed",
+          "The primary model kept failing the rule; the fallback returned a valid answer <b>"
+          +d.fallback_saves+"</b> time(s). Spent <b>"+fmt(d.spent_usd)+"</b>.");
+        break;
+      case "reset": clean();metrics(d);break;
+    }
+  };
+
+  // ---- run ----
+  function start(url){
+    if(running)return;running=true;runBtns.forEach(function(b){b.disabled=true;});
+    $("banner").className="banner";$("stamp").classList.remove("show");
+    $("state").classList.remove("tripped");$("stateText").textContent="Armed";
+    fetch(url,{method:"POST"}).then(function(r){return r.json().then(function(j){return {s:r.status,j:j};});})
+      .then(function(x){if(x.s>=400){row("kill","&#10007;",esc(x.j.error||"error"),"");endRun();}})
+      .catch(function(){endRun();});
+  }
+  $("runReal").onclick=function(){save(function(){start("/run/real");});};
+  $("runDemo").onclick=function(){start($("demoSelect").value);};
+  $("stopBtn").onclick=function(){fetch("/stop",{method:"POST"}).catch(function(){});};
+  $("reset").onclick=function(){fetch("/demo/reset",{method:"POST"}).catch(function(){});};
+})();
+</script>
+</body>
+</html>

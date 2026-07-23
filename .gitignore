@@ -1,0 +1,32 @@
+# ---- secrets: never commit these -------------------------------------------
+.env
+.env.*
+*.env
+secrets.*
+*_secret*
+*.key
+*.pem
+config.local.*
+try_it_real_local.py
+
+# ---- python ----------------------------------------------------------------
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+*.egg-info/
+.pytest_cache/
+
+# ---- logs / runtime --------------------------------------------------------
+*.log
+server.log
+events.log
+nohup.out
+
+# ---- editors / OS ----------------------------------------------------------
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini

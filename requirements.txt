@@ -1,0 +1,6 @@
+openai>=1.0
+tiktoken>=0.5
+fastapi>=0.100
+uvicorn>=0.20
+httpx>=0.24
+jsonschema>=4.0   # circuit-breaker di qualità (fallback minimale se assente)
