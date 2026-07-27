@@ -3,6 +3,7 @@
 .env.*
 *.env
 secrets.*
+!scan_secrets.py
 *_secret*
 *.key
 *.pem
