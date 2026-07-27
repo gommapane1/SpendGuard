@@ -36,8 +36,10 @@ with httpx.Client(timeout=None) as c:
             pass
 sent = mock_llm_server.LAST_REQUEST.get("max_tokens")
 print(f"budget $1.00, client didn't set max_tokens -> proxy sent max_tokens = {sent}")
-assert sent is not None and sent <= spend_proxy.DEFAULT_MAX_TOKENS, "max_tokens inflated!"
-print("max_tokens capped sanely   : PASS  (was thousands -> Groq 413)")
+# Corretto: o non lo inviamo affatto (budget ampio, nessun troncamento), oppure
+# lo inviamo entro il tetto. Mai un valore gonfiato che scatena il 413 di Groq.
+assert sent is None or sent <= spend_proxy.MAX_TOKENS_CEILING, "max_tokens inflated!"
+print("max_tokens never inflated  : PASS  (was thousands -> Groq 413)")
 
 # se il client CHIEDE un valore, lo rispettiamo (non lo alziamo mai)
 body2 = dict(body); body2["max_tokens"] = 32

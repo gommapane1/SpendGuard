@@ -49,14 +49,40 @@ from checks import run_check
 PROXY_PORT = int(os.environ.get("SPENDGUARD_PORT", "8900"))
 PROGRESS_EVERY_TOKENS = 45
 
-# Tetto di sicurezza per max_tokens quando il chiamante non lo specifica.
-# BUG FIX: senza questo, calcolavamo max_tokens dal budget (anche migliaia di
-# token) e provider come Groq rifiutano la richiesta con HTTP 413 "Request too
-# large". Non gonfiamo mai la richiesta: al massimo la riduciamo.
-DEFAULT_MAX_TOKENS = int(os.environ.get("SPENDGUARD_MAX_TOKENS", "512"))
+# Tetto di sicurezza per max_tokens. NON e' un limite di lunghezza: lo mandiamo
+# all'upstream solo quando serve davvero (budget stretto o richiesta esplicita).
+# Serve a evitare il caso in cui, con budget ampio, calcoleremmo un max_tokens
+# enorme e provider come Groq rifiuterebbero con HTTP 413 "Request too large".
+MAX_TOKENS_CEILING = int(os.environ.get("SPENDGUARD_MAX_TOKENS", "4096"))
+# connect breve (un provider irraggiungibile deve fallire subito), read lungo
+# (una generazione lenta e' normale e non va interrotta per timeout).
+_TIMEOUT = httpx.Timeout(connect=10.0, read=180.0, write=30.0, pool=10.0)
 
 _HERE = Path(__file__).resolve().parent
 app = FastAPI(title="SpendGuard")
+
+# --- protezione CSRF sugli endpoint di controllo -----------------------------
+# Il proxy ascolta su localhost, ma una pagina web aperta nel browser puo'
+# comunque inviargli richieste POST (es. per spegnere le difese o alzare il
+# budget). Le richieste con un `Origin` diverso dal nostro vengono rifiutate.
+# Il percorso /v1 e' escluso: li' passano gli agenti, che possono legittimamente
+# girare dentro una pagina web.
+_CONTROL_PREFIXES = ("/config", "/run", "/demo", "/stop")
+
+
+@app.middleware("http")
+async def _guard_control_endpoints(request: Request, call_next):
+    if request.method == "POST" and request.url.path.startswith(_CONTROL_PREFIXES):
+        origin = request.headers.get("origin")
+        if origin:
+            allowed = {"http://127.0.0.1:" + str(PROXY_PORT),
+                       "http://localhost:" + str(PROXY_PORT)}
+            if origin not in allowed:
+                return JSONResponse(status_code=403, content={"error": {
+                    "type": "cross_origin_blocked", "code": "cross_origin_blocked",
+                    "message": ("SpendGuard refused a control request from another "
+                                "origin (" + origin + "). Use the local dashboard.")}})
+    return await call_next(request)
 
 PROVIDER_PRESETS = {
     "openai": "https://api.openai.com/v1",
@@ -449,9 +475,25 @@ def _quality_stats() -> dict:
             "trip_after": config.trip_after}
 
 
+_unpriced: set[str] = set()      # modelli non a listino: prezzo stimato
+_price_warned: set[str] = set()  # gia' segnalati alla dashboard
+
+
 def _price(model: str) -> tuple[float, float]:
+    if model not in _prices:
+        _unpriced.add(model)
     in_1m, out_1m = _prices.get(model, FALLBACK_PRICE_PER_1M)
     return in_1m / 1_000_000.0, out_1m / 1_000_000.0
+
+
+async def _warn_if_unpriced(model: str) -> None:
+    """Il prezzo di ripiego puo' essere molto lontano da quello reale: meglio
+    dirlo che mostrare una spesa sbagliata senza spiegazioni."""
+    if model in _unpriced and model not in _price_warned:
+        _price_warned.add(model)
+        await publish("price_warning", model=model,
+                      fallback_in=FALLBACK_PRICE_PER_1M[0],
+                      fallback_out=FALLBACK_PRICE_PER_1M[1])
 
 
 def _messages_to_text(messages: list[dict[str, Any]]) -> str:
@@ -535,8 +577,15 @@ async def _record_quality(model: str, ok: bool, reason: str = "",
 async def _metered_upstream(body, model, input_cost, price_out, hard_cap, auth_header=None):
     upstream_body = dict(body)
     upstream_body["stream"] = True
-    upstream_body["max_tokens"] = hard_cap
-    upstream_body["stream_options"] = {"include_usage": True}
+    # max_tokens si invia SOLO se serve davvero (vedi _preflight): non tocchiamo
+    # la richiesta del client quando il budget e' ampio.
+    if hard_cap is None:
+        upstream_body.pop("max_tokens", None)
+    else:
+        upstream_body["max_tokens"] = hard_cap
+    # NOTA: niente `stream_options`. Non lo usiamo (contiamo i token in locale)
+    # e alcuni provider rifiutano i campi che non conoscono.
+    upstream_body.pop("stream_options", None)
     url = config.upstream.rstrip("/") + "/chat/completions"
 
     headers = {"content-type": "application/json"}
@@ -564,7 +613,7 @@ async def _metered_upstream(body, model, input_cost, price_out, hard_cap, auth_h
                   output_cap=hard_cap, **budget.as_dict())
 
     try:
-        async with httpx.AsyncClient(timeout=60.0) as client:
+        async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
             async with client.stream("POST", url, json=upstream_body, headers=headers) as resp:
                 if resp.status_code >= 400:
                     raw = (await resp.aread()).decode("utf-8", "replace")
@@ -575,7 +624,7 @@ async def _metered_upstream(body, model, input_cost, price_out, hard_cap, auth_h
                     except Exception:
                         pass
                     async with _budget_lock:
-                        budget.spent -= input_cost      # nulla e' stato generato
+                        budget.spent = max(0.0, budget.spent - input_cost)  # nulla generato
                         budget.calls += 1
                     await publish("upstream_error", model=model,
                                   status=resp.status_code, detail=detail,
@@ -618,14 +667,22 @@ async def _metered_upstream(body, model, input_cost, price_out, hard_cap, auth_h
                                         break
                                 if fn.get("arguments"):
                                     arg = fn["arguments"]
-                                    slot["function"]["arguments"] += arg
-                                    # gli argomenti costano token: li contiamo
                                     dt = _count_tokens(arg, model)
+                                    dt_cost = dt * price_out
+                                    # Anche gli argomenti costano: passano dal
+                                    # kill-switch come il testo, altrimenti una
+                                    # tool call lunga sforerebbe il budget.
                                     async with _budget_lock:
-                                        budget.spent += dt * price_out
-                                        output_cost += dt * price_out
-                                        out_tokens += dt
-                            if blocked_tool:
+                                        if budget.spent + dt_cost >= budget.limit:
+                                            halted = True
+                                        else:
+                                            budget.spent += dt_cost
+                                            output_cost += dt_cost
+                                            out_tokens += dt
+                                    if halted:
+                                        break
+                                    slot["function"]["arguments"] += arg
+                            if blocked_tool or halted:
                                 # taglio lo stream: l'azione non arrivera' mai al client
                                 break
                             yield {"type": "tool_delta", "tool_calls": tcs}
@@ -658,7 +715,7 @@ async def _metered_upstream(body, model, input_cost, price_out, hard_cap, auth_h
     except Exception as exc:
         async with _budget_lock:
             if out_tokens == 0:
-                budget.spent -= input_cost   # nulla generato: non deve costare
+                budget.spent = max(0.0, budget.spent - input_cost)  # non deve costare
             budget.calls += 1
         await publish("upstream_error", model=model, status=502, detail=str(exc)[:300],
                       **budget.as_dict())
@@ -705,6 +762,7 @@ async def _preflight(body: dict, model: str):
     fallback sono diversi). Ritorna (refuse|None, input_tokens, input_cost,
     price_out, hard_cap)."""
     price_in, price_out = _price(model)
+    await _warn_if_unpriced(model)
     text = _messages_to_text(body.get("messages", []))
     input_tokens = _count_tokens(text, model)
     input_cost = input_tokens * price_in
@@ -722,9 +780,18 @@ async def _preflight(body: dict, model: str):
         return (refuse, input_tokens, input_cost, price_out, 0)
 
     affordable = int((budget.remaining - input_cost) // price_out) if price_out > 0 else 10 ** 7
-    requested = body.get("max_tokens") or DEFAULT_MAX_TOKENS
-    # non gonfiamo mai la richiesta del client: al massimo la riduciamo
-    hard_cap = max(1, min(requested, affordable))
+    asked = body.get("max_tokens")
+    if asked:
+        # Il client ha chiesto un limite: lo rispettiamo, riducendolo se il
+        # budget non lo copre. Non lo alziamo mai.
+        hard_cap = max(1, min(int(asked), affordable))
+    elif affordable < MAX_TOKENS_CEILING:
+        # Budget stretto: il tetto lo imponiamo noi, altrimenti si sfonderebbe.
+        hard_cap = max(1, affordable)
+    else:
+        # Budget ampio e nessun limite richiesto: NON tocchiamo la richiesta.
+        # (prima forzavamo 512 token, troncando risposte legittime)
+        hard_cap = None
     return (None, input_tokens, input_cost, price_out, hard_cap)
 
 
@@ -1104,6 +1171,12 @@ async def chat_completions(request: Request):
 #  Config / stats / eventi — tutto pilotabile dalla dashboard
 # =============================================================================
 
+@app.get("/health")
+async def health():
+    return {"status": "ok", "upstream": config.upstream,
+            "enforcement_mode": enforcement.mode}
+
+
 @app.get("/stats")
 async def stats():
     d = budget.as_dict()
@@ -1137,6 +1210,15 @@ async def set_config(request: Request):
         config.model = str(data["model"]).strip()
     if "fallback_model" in data:
         config.fallback_model = str(data.get("fallback_model") or "").strip()
+    if isinstance(data.get("prices"), dict):
+        # prezzi reali del tuo provider, in USD per 1M token: {"model":[in,out]}
+        for m, pair in data["prices"].items():
+            try:
+                _prices[str(m)] = (float(pair[0]), float(pair[1]))
+                _unpriced.discard(str(m))
+                _price_warned.discard(str(m))
+            except Exception:
+                pass
     if data.get("require_consensus") is not None:
         config.require_consensus = bool(data["require_consensus"])
     if "consensus_model" in data:
@@ -1472,7 +1554,7 @@ async def unleash_tools():
                                "description": "Delete a database",
                                "parameters": {"type": "object"}}}]
         try:
-            async with httpx.AsyncClient(timeout=60.0) as client:
+            async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
                 for i in range(3):
                     await client.post(url, json={
                         "model": "tool-caller-danger", "tools": tools, "stream": False,

@@ -488,6 +488,7 @@
       case "consensus_ok": row("ok","&#10003;","consensus passed &mdash; both models agreed","$"+Number(d.cost_usd).toFixed(4));metrics(d);break;
       case "consensus_failed": row("kill","&#9632;","403 &mdash; consensus failed: "+esc(d.reason),"");metrics(d);trip("Consensus failed");break;
       case "shadow_block": row("warn","&#128065;","shadow: would block ("+esc(d.defense)+")","observed");metrics(d);break;
+      case "price_warning": row("warn","&#9888;","no price list for "+esc(d.model)+" &mdash; cost is ESTIMATED, set the real price to be accurate","estimate");break;
       case "upstream_error": row("kill","&#10007;","provider error "+esc(d.status)+" &mdash; "+esc(d.detail),"");metrics(d);break;
       case "agent_error": row("kill","&#10007;",esc(d.detail),"");break;
       case "loop_stopped":
