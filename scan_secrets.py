@@ -1,6 +1,6 @@
 """
 ================================================================================
- scan_secrets.py — run this BEFORE you publish anything
+ scan_secrets.py - run this BEFORE you publish anything
 ================================================================================
 
     python scan_secrets.py
@@ -64,7 +64,7 @@ def scan_file(path: Path) -> list[tuple[int, str, str, str]]:
             if re.search(rx, line):
                 shown = line.strip()
                 if len(shown) > 110:
-                    shown = shown[:110] + "…"
+                    shown = shown[:110] + "..."
                 hits.append((i, name, sev, shown))
                 break
     return hits
@@ -89,9 +89,20 @@ def scan_git_history() -> list[str]:
     if not (ROOT / ".git").exists():
         return []
     try:
-        blob = subprocess.run(["git", "log", "-p", "--all"], cwd=ROOT,
-                              capture_output=True, text=True, timeout=90).stdout
-    except Exception:
+        # encoding esplicito: su Windows la codifica di sistema (cp1252) va in
+        # errore appena la cronologia contiene un byte che non sa decodificare.
+        # errors="replace" sostituisce quei byte invece di far fallire tutto.
+        proc = subprocess.run(["git", "log", "-p", "--all"], cwd=ROOT,
+                              capture_output=True, timeout=180,
+                              encoding="utf-8", errors="replace")
+        blob = proc.stdout or ""
+    except FileNotFoundError:
+        print("  (git non trovato: cronologia non controllata)\n")
+        return []
+    except Exception as exc:
+        print("  (impossibile leggere la cronologia git: " + str(exc)[:80] + ")\n")
+        return []
+    if not blob:
         return []
     found = []
     for name, rx, sev in PATTERNS:
@@ -100,14 +111,14 @@ def scan_git_history() -> list[str]:
         for m in re.finditer(rx, blob):
             frag = m.group(0)
             if not any(t in frag.lower() for t in SAFE_TOKENS):
-                found.append(name + ": " + frag[:12] + "…")
+                found.append(name + ": " + frag[:12] + "...")
     return sorted(set(found))
 
 
 def main() -> int:
     files = walk()
     print("=" * 68)
-    print("  SpendGuard — pre-publish secret scan")
+    print("  SpendGuard - pre-publish secret scan")
     print("=" * 68)
     print("  scanning " + str(len(files)) + " files in " + str(ROOT))
     print()
@@ -132,7 +143,7 @@ def main() -> int:
 
     hist = scan_git_history()
     if hist:
-        print("  GIT HISTORY — secrets found in past commits:")
+        print("  GIT HISTORY - secrets found in past commits:")
         for h in hist:
             print("   !! " + h)
         print("      Removing them from the files is NOT enough: rotate the key,")
