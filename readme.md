@@ -49,7 +49,31 @@ Your API key lives only in the local process's memory. It is forwarded to your p
 
 ### 1. Loop detection (stateful)
 
-Traditional proxies are stateless: every request looks new. SpendGuard keeps a short per-key memory of prompt fingerprints (SHA-256; the API key itself is hashed, never stored) and breaks the circuit when the same prompt repeats N times inside a time window. The breaker **re-closes automatically** when the agent sends a different prompt — it made progress, so it isn't locked out forever.
+Traditional proxies are stateless: every request looks new. SpendGuard keeps a short per-key memory (the API key itself is hashed, never stored) and breaks the circuit when the agent repeats the same **move** N times inside a time window.
+
+The first version hashed the prompt text. Three developers independently pointed out the same flaw: a stuck agent usually *rewords* the failing request slightly, so a text hash never matches even though it's the same dead end. So matching now runs on three signals, in order of reliability:
+
+1. **Action** — hash of the last tool call, name plus arguments. The strong signal: catches an agent retrying the same action in different words. When both requests carry an action, the action decides in *both* directions — different arguments means different work, no matter how similar the wording.
+2. **Fuzzy prompt** — token overlap between requests, for trivial rewordings. Best-effort, not infallible.
+3. **Exact** — identical conversation.
+
+Requests that differ on any identifier containing digits (`item 1` vs `item 2`, `account 1204` vs `account 1205`) are never treated as a loop. A batch worker processing records is doing real work, and blocking it would be the most damaging false positive possible.
+
+The breaker **re-closes automatically** when the agent changes its move — it made progress, so it isn't locked out forever.
+
+### 1b. Per-run budget
+
+The session budget alone has a failure mode a developer described from experience: one runaway run eats the whole day's budget, and everything after it fails for an unrelated reason. So each run can have its own ceiling, independent of the session.
+
+A "run" is identified either by an explicit header your client sends:
+
+```
+X-SpendGuard-Run: my-nightly-job-2026-07-28
+```
+
+or, if you send nothing, inferred from the first system + first user message. As an agent works the conversation grows, but those two messages stay the same, so they identify the run.
+
+When a run hits its ceiling it gets `402` with code `run_budget_exceeded`. Other runs keep working.
 
 ### 2. Spend cap
 
@@ -101,7 +125,9 @@ Everything is configurable from the dashboard. `POST /config` accepts the same f
   "model": "llama-3.1-8b-instant",
   "api_key": "...",
   "budget_usd": 5.00,
+  "per_run_budget_usd": 0.50,
   "loop_detection": true,
+  "loop_fuzzy_threshold": 0.8,
   "loop_threshold": 3,
   "check_policy": {"type": "json_schema", "schema": {}},
   "fallback_model": "llama-3.3-70b-versatile",
@@ -113,7 +139,7 @@ Everything is configurable from the dashboard. `POST /config` accepts the same f
 }
 ```
 
-Environment variables work too: `SPENDGUARD_UPSTREAM`, `SPENDGUARD_BUDGET`, `SPENDGUARD_PORT`, `SPENDGUARD_MAX_TOKENS`, `SPENDGUARD_LOOP_THRESHOLD`.
+Environment variables work too: `SPENDGUARD_UPSTREAM`, `SPENDGUARD_BUDGET`, `SPENDGUARD_PORT`, `SPENDGUARD_MAX_TOKENS`, `SPENDGUARD_LOOP_THRESHOLD`, `SPENDGUARD_RUN_BUDGET`.
 
 ### Pricing
 
@@ -145,6 +171,7 @@ python test_quality.py      # quality breaker
 python test_fallback.py     # quality-triggered fallback
 python test_tools.py        # action firewall
 python test_loop.py         # stateful loop detection
+python test_loop_v2.py      # action-based matching, per-run budget, batch-worker safety
 python test_consensus.py    # consensus + shadow mode
 python test_config.py       # configuration, error propagation
 python test_hardening.py    # truncation, CSRF, pricing warnings
@@ -162,7 +189,9 @@ Before publishing anything: `python scan_secrets.py` — scans the folder **and 
 - **One global budget**, not per-agent. Loop detection is already per-key; the budget isn't yet.
 - **Tested against OpenAI-compatible endpoints.** OpenAI and Groq are the tested paths; other providers are best-effort.
 - **Quality rules and consensus buffer the response.** Streaming is untouched for everything else, but you cannot un-send tokens, so validating means holding them briefly.
-- **Loop detection can catch legitimate retries.** An agent retrying the same prompt after a transient failure will trip it at the threshold. Tune it, or run shadow mode first to see whether it matters for your workload.
+- **Loop detection can catch legitimate retries.** An agent deliberately retrying the same action after a transient failure will trip it at the threshold. Tune it, or run shadow mode first to see whether it matters for your workload.
+- **Fuzzy prompt matching is best-effort.** It catches trivial rewordings. Heavier paraphrases with no tool call attached can still slip through — the action signal is the one to rely on.
+- **No detection for volume spikes without repetition.** A developer described a run where an upstream source changed and volume went up 10x with every call unique and legitimate. Nothing here would catch that. An input-volume ceiling is the next thing to build.
 
 ---
 

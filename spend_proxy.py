@@ -35,6 +35,7 @@ import threading
 import time
 import webbrowser
 from collections import deque
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -154,29 +155,94 @@ _demo_task: "asyncio.Task | None" = None
 #  STATEFUL LOOP DETECTION — la terza linea di difesa
 # =============================================================================
 #  I proxy tradizionali sono senza memoria: vedono ogni richiesta isolata e non
-#  possono accorgersi che un agente e' incastrato in un `while True` che rimanda
-#  lo STESSO identico prompt. Qui teniamo una memoria leggera per identita'
-#  (chiave API) e blocchiamo il loop PRIMA di inoltrare al provider: costo zero.
+#  possono accorgersi che un agente e' incastrato in un `while True`.
+#
+#  ATTENZIONE, lezione dal campo: la prima versione hashava il TESTO del prompt.
+#  Tre sviluppatori indipendenti hanno segnalato lo stesso difetto: l'agente che
+#  si incastra di solito RIFORMULA leggermente la stessa richiesta fallita, quindi
+#  l'hash del testo non combacia mai anche se e' lo stesso vicolo cieco. La firma
+#  giusta e' sull'AZIONE (nome del tool + argomenti), non sulle parole.
+#
+#  Ora usiamo tre segnali indipendenti, in ordine di affidabilita':
+#    1. ACTION  - hash dell'ultima tool call (nome + argomenti). Il piu' solido:
+#                 cattura l'agente che ritenta la stessa azione con parole diverse.
+#    2. FUZZY   - somiglianza (Jaccard) fra le parole significative del prompt.
+#                 Cattura le riformulazioni banali. Best-effort, non infallibile.
+#    3. EXACT   - hash esatto dell'intera conversazione. Il caso piu' semplice.
 #
 #  Note di progetto:
 #   - L'identita' e' l'HASH della chiave, mai la chiave in chiaro.
-#   - L'impronta del prompt e' SHA-256 di (modello + ruoli + contenuti).
-#   - Il breaker si RIAPRE da solo se l'agente manda un prompt diverso: significa
-#     che si e' sbloccato, e non vogliamo lasciarlo fuori per sempre.
+#   - Il breaker si RIAPRE da solo quando l'agente cambia davvero comportamento.
 #   - La memoria viene potata: nessuna crescita illimitata.
 
+# Parole troppo comuni per distinguere due richieste: le togliamo prima di
+# confrontare, altrimenti "the/and/for" fanno sembrare simili prompt diversi.
+_STOPWORDS = {
+    "a", "an", "the", "and", "or", "but", "if", "then", "so", "to", "of", "in",
+    "on", "at", "for", "with", "from", "by", "as", "is", "are", "was", "were",
+    "be", "been", "being", "do", "does", "did", "doing", "have", "has", "had",
+    "will", "would", "can", "could", "should", "may", "might", "must", "this",
+    "that", "these", "those", "it", "its", "you", "your", "i", "me", "my", "we",
+    "our", "us", "he", "she", "they", "them", "please", "now", "again", "also",
+    "just", "very", "any", "all", "some", "not", "no", "yes", "ok", "okay",
+}
+
+_WORD_RE = re.compile(r"[a-z0-9_]+")
+
+
+@dataclass(frozen=True)
+class LoopSignature:
+    """I tre segnali estratti da una richiesta."""
+    action: str | None          # hash dell'ultima tool call, se presente
+    exact: str                  # hash esatto della conversazione
+    tokens: frozenset           # parole significative dell'ultimo messaggio
+
+    def matches(self, other: "LoopSignature", fuzzy_threshold: float) -> tuple[bool, str]:
+        """Due richieste sono 'la stessa mossa'? Ritorna (si/no, quale segnale).
+
+        Regola chiave: quando ENTRAMBE hanno un'azione, l'azione DECIDE, nei due
+        sensi. Un agente che processa ordini diversi usa spesso lo stesso testo
+        ("processa il prossimo ordine") ma argomenti diversi: e' lavoro vero, non
+        un loop, e il confronto testuale da solo lo scambierebbe per tale."""
+        if self.action and other.action:
+            if self.action == other.action:
+                return (True, "same tool call and arguments")
+            return (False, "")          # azioni diverse -> lavoro diverso, punto
+        # Nessuna azione da confrontare: ripieghiamo sul testo.
+        if self.exact == other.exact:
+            return (True, "identical prompt")
+        if self.tokens and other.tokens:
+            # Se le due richieste differiscono su un IDENTIFICATIVO (qualsiasi
+            # token contenente cifre: "order 1234", "batch 7", "item 0"), e'
+            # lavoro diverso, non un loop. E' il caso del lavoratore a lotti, ed
+            # e' il falso positivo piu' dannoso possibile.
+            diff = self.tokens ^ other.tokens
+            if any(any(ch.isdigit() for ch in t) for t in diff):
+                return (False, "")
+            inter = len(self.tokens & other.tokens)
+            union = len(self.tokens | other.tokens)
+            if union and (inter / union) >= fuzzy_threshold:
+                return (True, "near-identical prompt (reworded)")
+        return (False, "")
+
+
 class LoopDetector:
-    def __init__(self, threshold: int = 3, window_s: float = 60.0) -> None:
+    def __init__(self, threshold: int = 3, window_s: float = 60.0,
+                 fuzzy_threshold: float = 0.8) -> None:
         self.enabled = True
         self.threshold = int(threshold)
         self.window_s = float(window_s)
-        self._hist: dict[str, deque] = {}     # identita' -> deque[(impronta, ts)]
-        self._state: dict[str, dict] = {}     # identita' -> {tripped, hash}
+        # Quanto devono somigliarsi due prompt per considerarli la stessa mossa.
+        # 1.0 = solo identici. Sotto 0.6 si rischiano falsi positivi.
+        self.fuzzy_threshold = float(fuzzy_threshold)
+        self._hist: dict[str, deque] = {}     # identita' -> deque[(firma, ts)]
+        self._state: dict[str, dict] = {}     # identita' -> {tripped, sig}
         self.trips = 0
         self.blocked = 0
+        self.trips_by_signal: dict[str, int] = {}
         self._max_identities = 500
 
-    # ---- utilita' -------------------------------------------------------
+    # ---- estrazione dei segnali -----------------------------------------
     @staticmethod
     def identity(auth_header: str | None) -> str:
         """Bucket per chiave API. Non teniamo mai la chiave in chiaro."""
@@ -185,7 +251,65 @@ class LoopDetector:
         return hashlib.sha256(auth_header.encode("utf-8")).hexdigest()[:16]
 
     @staticmethod
-    def fingerprint(model: str, messages: list) -> str:
+    def _last_action(messages: list) -> str | None:
+        """Hash dell'ULTIMA tool call presente nella conversazione: e' l'azione
+        che l'agente ha appena tentato. Se l'agente ritenta lo stesso tool con
+        gli stessi argomenti, questo hash e' identico anche se il testo cambia."""
+        for m in reversed(messages or []):
+            calls = m.get("tool_calls")
+            if calls:
+                h = hashlib.sha256()
+                for c in calls:
+                    fn = c.get("function") or {}
+                    h.update(str(fn.get("name", "")).encode("utf-8"))
+                    h.update(b"\x1e")
+                    args = fn.get("arguments", "")
+                    # normalizziamo il JSON: chiavi ordinate, niente spazi
+                    try:
+                        args = json.dumps(json.loads(args), sort_keys=True)
+                    except Exception:
+                        args = str(args).strip()
+                    h.update(args.encode("utf-8"))
+                    h.update(b"\x1f")
+                return h.hexdigest()
+            # formato legacy function_call
+            fc = m.get("function_call")
+            if fc:
+                h = hashlib.sha256()
+                h.update(str(fc.get("name", "")).encode("utf-8"))
+                h.update(str(fc.get("arguments", "")).encode("utf-8"))
+                return h.hexdigest()
+        return None
+
+    @staticmethod
+    def _text_of(m: dict) -> str:
+        c = m.get("content", "")
+        if isinstance(c, str):
+            return c
+        if isinstance(c, list):
+            return " ".join(p.get("text", "") for p in c
+                            if isinstance(p, dict) and p.get("type") == "text")
+        return ""
+
+    @classmethod
+    def _tokens(cls, messages: list) -> frozenset:
+        """Parole significative dell'ultimo messaggio non di sistema: e' cio' che
+        l'agente sta chiedendo ADESSO."""
+        for m in reversed(messages or []):
+            if m.get("role") == "system":
+                continue
+            text = cls._text_of(m)
+            if not text:
+                continue
+            # NB: teniamo anche i token di un solo carattere. Sono spesso
+            # l'elemento distintivo ("item 1" vs "item 2") e scartarli faceva
+            # sembrare identiche richieste che non lo erano.
+            words = {w for w in _WORD_RE.findall(text.lower()) if w not in _STOPWORDS}
+            return frozenset(words)
+        return frozenset()
+
+    @classmethod
+    def signature(cls, model: str, messages: list) -> LoopSignature:
         h = hashlib.sha256()
         h.update((model or "").encode("utf-8"))
         for m in messages or []:
@@ -196,16 +320,23 @@ class LoopDetector:
                 c = json.dumps(c, sort_keys=True, ensure_ascii=False)
             h.update(b"\x1e")
             h.update(c.encode("utf-8"))
-        return h.hexdigest()
+        return LoopSignature(action=cls._last_action(messages),
+                             exact=h.hexdigest(),
+                             tokens=cls._tokens(messages))
 
-    def _consecutive(self, dq: deque, fp: str, now: float) -> int:
-        """Quante volte di fila (dalla piu' recente) compare `fp` nella finestra."""
-        n = 0
-        for h, ts in reversed(dq):
-            if h != fp or (now - ts) > self.window_s:
+    # ---- conteggio ------------------------------------------------------
+    def _consecutive(self, dq: deque, sig: LoopSignature, now: float) -> tuple[int, str]:
+        """Quante volte di fila (dalla piu' recente) si ripete la stessa mossa."""
+        n, why = 0, ""
+        for prev, ts in reversed(dq):
+            if (now - ts) > self.window_s:
+                break
+            same, reason = sig.matches(prev, self.fuzzy_threshold)
+            if not same:
                 break
             n += 1
-        return n
+            why = why or reason
+        return n, why
 
     def _prune(self, now: float) -> None:
         stale = [k for k, dq in self._hist.items()
@@ -219,49 +350,162 @@ class LoopDetector:
                 self._state.pop(k, None)
 
     # ---- il metodo che conta -------------------------------------------
-    def observe(self, ident: str, fp: str) -> tuple[str, int]:
-        """Registra la richiesta. Ritorna (verdetto, ripetizioni):
+    def observe(self, ident: str, sig: LoopSignature) -> tuple[str, int, str]:
+        """Registra la richiesta. Ritorna (verdetto, ripetizioni, segnale):
         'ok' | 'repeat' (avviso) | 'trip' (scatta ora) | 'block' (gia' scattato)."""
         now = time.monotonic()
         self._prune(now)
-        st = self._state.setdefault(ident, {"tripped": False, "hash": None})
+        st = self._state.setdefault(ident, {"tripped": False, "sig": None, "why": ""})
         dq = self._hist.setdefault(ident, deque(maxlen=64))
 
         if st["tripped"]:
-            if fp != st["hash"]:
-                # prompt diverso: l'agente si e' sbloccato -> richiudiamo
+            same, _ = sig.matches(st["sig"], self.fuzzy_threshold) if st["sig"] else (False, "")
+            if not same:
+                # mossa diversa: l'agente si e' sbloccato -> richiudiamo
                 st["tripped"] = False
-                st["hash"] = None
+                st["sig"] = None
+                st["why"] = ""
                 dq.clear()
             else:
                 self.blocked += 1
-                return ("block", max(self.threshold, self._consecutive(dq, fp, now)))
+                n, _ = self._consecutive(dq, sig, now)
+                return ("block", max(self.threshold, n), st["why"])
 
-        dq.append((fp, now))
-        n = self._consecutive(dq, fp, now)
+        # Confrontiamo con lo storico PRIMA di inserire la firma corrente:
+        # altrimenti la prima comparazione sarebbe con se stessa e il motivo
+        # riportato risulterebbe sempre "identical prompt".
+        n_prev, why = self._consecutive(dq, sig, now)
+        dq.append((sig, now))
+        n = n_prev + 1
         if n >= self.threshold:
             st["tripped"] = True
-            st["hash"] = fp
+            st["sig"] = sig
+            st["why"] = why
             self.trips += 1
             self.blocked += 1
-            return ("trip", n)
-        return ("repeat" if n > 1 else "ok", n)
+            self.trips_by_signal[why] = self.trips_by_signal.get(why, 0) + 1
+            return ("trip", n, why)
+        return ("repeat" if n > 1 else "ok", n, why)
 
     def reset(self) -> None:
         self._hist.clear()
         self._state.clear()
         self.trips = 0
         self.blocked = 0
+        self.trips_by_signal.clear()
 
     def stats(self) -> dict:
         return {"loop_enabled": self.enabled, "loop_threshold": self.threshold,
                 "loop_window_s": self.window_s, "loop_trips": self.trips,
-                "loop_blocked": self.blocked}
+                "loop_blocked": self.blocked,
+                "loop_fuzzy_threshold": self.fuzzy_threshold,
+                "loop_trips_by_signal": dict(self.trips_by_signal)}
 
 
 loop_detector = LoopDetector(
     threshold=int(os.environ.get("SPENDGUARD_LOOP_THRESHOLD", "3")),
     window_s=float(os.environ.get("SPENDGUARD_LOOP_WINDOW", "60")))
+
+
+# =============================================================================
+#  PER-RUN BUDGET — un tetto per singola esecuzione, oltre a quello di sessione
+# =============================================================================
+#  Segnalato da chi l'ha vissuto: con il solo tetto giornaliero, UNA esecuzione
+#  impazzita si mangia l'intero budget e tutte quelle successive falliscono per
+#  una ragione che non c'entra niente. Serve un tetto per run, indipendente.
+#
+#  Come si riconosce una "run" dall'interno di un proxy che vede solo chiamate
+#  singole? Due modi, in ordine di precisione:
+#    1. Il client manda l'header `X-SpendGuard-Run: <id>`. Preciso e consigliato.
+#    2. Altrimenti la deduciamo: hash del PRIMO messaggio di sistema + PRIMO
+#       messaggio utente. Mentre l'agente lavora la conversazione cresce, ma
+#       quei due messaggi restano gli stessi -> identificano la run.
+
+class RunTracker:
+    def __init__(self, ttl_s: float = 3600.0) -> None:
+        self.per_run_limit: float | None = None    # None = disattivato
+        self.ttl_s = float(ttl_s)
+        self._runs: dict[str, dict] = {}
+        self.runs_stopped = 0
+        self._max_runs = 2000
+
+    @staticmethod
+    def identify(header: str | None, messages: list) -> str:
+        if header:
+            return "h:" + hashlib.sha256(str(header).encode("utf-8")).hexdigest()[:16]
+        h = hashlib.sha256()
+        got_system = got_user = False
+        for m in messages or []:
+            role = m.get("role")
+            if role == "system" and not got_system:
+                got_system = True
+            elif role == "user" and not got_user:
+                got_user = True
+            else:
+                continue
+            c = m.get("content", "")
+            if not isinstance(c, str):
+                c = json.dumps(c, sort_keys=True, ensure_ascii=False)
+            h.update(role.encode("utf-8"))
+            h.update(b"\x1e")
+            h.update(c.encode("utf-8"))
+            if got_user:
+                break
+        return "i:" + h.hexdigest()[:16]
+
+    def _prune(self, now: float) -> None:
+        stale = [k for k, r in self._runs.items() if (now - r["last"]) > self.ttl_s]
+        for k in stale:
+            self._runs.pop(k, None)
+        if len(self._runs) > self._max_runs:
+            for k in list(self._runs)[:len(self._runs) - self._max_runs]:
+                self._runs.pop(k, None)
+
+    def get(self, run_id: str) -> dict:
+        now = time.monotonic()
+        self._prune(now)
+        r = self._runs.setdefault(run_id, {"spent": 0.0, "calls": 0,
+                                           "last": now, "stopped": False})
+        r["last"] = now
+        return r
+
+    def would_exceed(self, run_id: str, extra_usd: float) -> bool:
+        if self.per_run_limit is None:
+            return False
+        return (self.get(run_id)["spent"] + extra_usd) >= self.per_run_limit
+
+    def charge(self, run_id: str | None, usd: float) -> None:
+        if run_id is None:
+            return
+        r = self.get(run_id)
+        r["spent"] += usd
+
+    def mark_stopped(self, run_id: str) -> None:
+        r = self.get(run_id)
+        if not r["stopped"]:
+            r["stopped"] = True
+            self.runs_stopped += 1
+
+    def spent(self, run_id: str) -> float:
+        return self.get(run_id)["spent"]
+
+    def reset(self) -> None:
+        self._runs.clear()
+        self.runs_stopped = 0
+
+    def stats(self) -> dict:
+        return {"per_run_limit_usd": self.per_run_limit,
+                "runs_tracked": len(self._runs),
+                "runs_stopped": self.runs_stopped}
+
+
+run_tracker = RunTracker()
+_env_run_budget = os.environ.get("SPENDGUARD_RUN_BUDGET", "")
+if _env_run_budget:
+    try:
+        run_tracker.per_run_limit = float(_env_run_budget)
+    except ValueError:
+        pass
 
 
 # =============================================================================
@@ -536,6 +780,7 @@ def _reset_quality_counters() -> None:
     _fallback_attempts = 0
     _fallback_saves = 0
     loop_detector.reset()
+    run_tracker.reset()
     tool_firewall.blocked_count = 0
     enforcement.reset()
 
@@ -574,7 +819,8 @@ async def _record_quality(model: str, ok: bool, reason: str = "",
 #  Chiamata upstream con metering + kill-switch (concurrency-safe)
 # =============================================================================
 
-async def _metered_upstream(body, model, input_cost, price_out, hard_cap, auth_header=None):
+async def _metered_upstream(body, model, input_cost, price_out, hard_cap,
+                            auth_header=None, run_id=None):
     upstream_body = dict(body)
     upstream_body["stream"] = True
     # max_tokens si invia SOLO se serve davvero (vedi _preflight): non tocchiamo
@@ -603,11 +849,13 @@ async def _metered_upstream(body, model, input_cost, price_out, hard_cap, auth_h
 
     out_tokens, output_cost, since_progress = 0, 0.0, 0
     collected, halted, finish = [], False, None
+    halt_reason = "session"        # 'session' o 'run': quale tetto ha tagliato
     tool_slots: dict = {}          # index -> tool_call in costruzione
     blocked_tool = None            # (nome, motivo) se il firewall interviene
 
     async with _budget_lock:
         budget.spent += input_cost
+        run_tracker.charge(run_id, input_cost)
 
     await publish("call_start", model=model, input_cost_usd=input_cost,
                   output_cap=hard_cap, **budget.as_dict())
@@ -625,6 +873,7 @@ async def _metered_upstream(body, model, input_cost, price_out, hard_cap, auth_h
                         pass
                     async with _budget_lock:
                         budget.spent = max(0.0, budget.spent - input_cost)  # nulla generato
+                        run_tracker.charge(run_id, -input_cost)
                         budget.calls += 1
                     await publish("upstream_error", model=model,
                                   status=resp.status_code, detail=detail,
@@ -673,10 +922,14 @@ async def _metered_upstream(body, model, input_cost, price_out, hard_cap, auth_h
                                     # kill-switch come il testo, altrimenti una
                                     # tool call lunga sforerebbe il budget.
                                     async with _budget_lock:
-                                        if budget.spent + dt_cost >= budget.limit:
+                                        over_session = budget.spent + dt_cost >= budget.limit
+                                        over_run = run_tracker.would_exceed(run_id, dt_cost) if run_id else False
+                                        if over_session or over_run:
                                             halted = True
+                                            halt_reason = "run" if over_run and not over_session else "session"
                                         else:
                                             budget.spent += dt_cost
+                                            run_tracker.charge(run_id, dt_cost)
                                             output_cost += dt_cost
                                             out_tokens += dt
                                     if halted:
@@ -692,10 +945,14 @@ async def _metered_upstream(body, model, input_cost, price_out, hard_cap, auth_h
                             dt = _count_tokens(piece, model)
                             dt_cost = dt * price_out
                             async with _budget_lock:
-                                if budget.spent + dt_cost >= budget.limit:
+                                over_session = budget.spent + dt_cost >= budget.limit
+                                over_run = run_tracker.would_exceed(run_id, dt_cost) if run_id else False
+                                if over_session or over_run:
                                     halted = True
+                                    halt_reason = "run" if over_run and not over_session else "session"
                                 else:
                                     budget.spent += dt_cost
+                                    run_tracker.charge(run_id, dt_cost)
                                     output_cost += dt_cost
                                     out_tokens += dt
                             if halted:
@@ -716,6 +973,7 @@ async def _metered_upstream(body, model, input_cost, price_out, hard_cap, auth_h
         async with _budget_lock:
             if out_tokens == 0:
                 budget.spent = max(0.0, budget.spent - input_cost)  # non deve costare
+                run_tracker.charge(run_id, -input_cost)
             budget.calls += 1
         await publish("upstream_error", model=model, status=502, detail=str(exc)[:300],
                       **budget.as_dict())
@@ -749,7 +1007,8 @@ async def _metered_upstream(body, model, input_cost, price_out, hard_cap, auth_h
     await publish("call_done", model=model, cost_usd=call_cost, output_tokens=out_tokens,
                   was_halted=halted, **budget.as_dict())
     yield {"type": "final", "cost_usd": call_cost, "output_tokens": out_tokens,
-           "halted": halted, "finish": finish, "content": "".join(collected),
+           "halted": halted, "halt_reason": halt_reason if halted else None,
+           "finish": finish, "content": "".join(collected),
            "tool_calls": tools_out, "blocked_tool": blocked_tool}
 
 
@@ -757,7 +1016,25 @@ async def _metered_upstream(body, model, input_cost, price_out, hard_cap, auth_h
 #  Endpoint OpenAI-compatible enforced
 # =============================================================================
 
-async def _preflight(body: dict, model: str):
+_REFUSE_MESSAGES = {
+    "input_exceeds_budget": "input alone exceeds the remaining budget",
+    "no_budget_for_output": "no budget left to generate a reply",
+    "run_budget_exceeded": "this run has hit its own budget ceiling "
+                           "(the session budget is untouched, so other runs keep working)",
+}
+
+
+def _refuse_response(refuse: str, extra: dict | None = None) -> JSONResponse:
+    code = "run_budget_exceeded" if refuse == "run_budget_exceeded" else "insufficient_budget"
+    payload = {"error": {"type": "budget_exceeded", "code": code,
+                         "message": "SpendGuard refused before sending: "
+                                    + _REFUSE_MESSAGES.get(refuse, refuse) + "."}}
+    if extra:
+        payload["x_spendguard"] = extra
+    return JSONResponse(status_code=402, content=payload)
+
+
+async def _preflight(body: dict, model: str, run_id: str | None = None):
     """Controlli di budget per UNO specifico modello (i prezzi di primario e
     fallback sono diversi). Ritorna (refuse|None, input_tokens, input_cost,
     price_out, hard_cap)."""
@@ -774,8 +1051,14 @@ async def _preflight(body: dict, model: str):
             refuse = "input_exceeds_budget"
         elif price_out > 0 and (remaining - input_cost) < price_out:
             refuse = "no_budget_for_output"
+        elif run_id and run_tracker.would_exceed(run_id, input_cost):
+            # Tetto della singola esecuzione: una run impazzita non deve
+            # prosciugare il budget e far fallire tutte le altre.
+            refuse = "run_budget_exceeded"
         if refuse:
             budget.refused += 1
+            if refuse == "run_budget_exceeded":
+                run_tracker.mark_stopped(run_id)
     if refuse:
         return (refuse, input_tokens, input_cost, price_out, 0)
 
@@ -795,26 +1078,25 @@ async def _preflight(body: dict, model: str):
     return (None, input_tokens, input_cost, price_out, hard_cap)
 
 
-async def _attempt(body: dict, model: str, auth_header):
+async def _attempt(body: dict, model: str, auth_header, run_id: str | None = None):
     """Una chiamata completa, BUFFERIZZATA, verso `model`. Niente streaming al
     client: cosi' possiamo validare (ed eventualmente sostituire con il
     fallback) prima di rispondere."""
     call_body = dict(body)
     call_body["model"] = model
-    refuse, input_tokens, input_cost, price_out, hard_cap = await _preflight(call_body, model)
+    refuse, input_tokens, input_cost, price_out, hard_cap = await _preflight(call_body, model, run_id)
     if refuse:
         await publish("refused", model=model, reason=refuse, needed_usd=input_cost,
                       **budget.as_dict())
-        msg = ("input alone exceeds the remaining budget" if refuse == "input_exceeds_budget"
-               else "no budget left to generate a reply")
         return {"status": 402, "content": "", "cost": 0.0, "halted": False,
                 "finish": None, "input_tokens": input_tokens, "output_tokens": 0,
-                "tool_calls": [], "blocked_tool": None,
-                "error": "SpendGuard refused before sending: " + msg + "."}
+                "tool_calls": [], "blocked_tool": None, "refuse": refuse,
+                "error": "SpendGuard refused before sending: "
+                         + _REFUSE_MESSAGES.get(refuse, refuse) + "."}
 
     final = None
     async for item in _metered_upstream(call_body, model, input_cost, price_out,
-                                        hard_cap, auth_header):
+                                        hard_cap, auth_header, run_id):
         if item["type"] == "error":
             return {"status": item.get("status", 502), "content": "", "cost": 0.0,
                     "halted": False, "finish": None, "input_tokens": input_tokens,
@@ -888,18 +1170,23 @@ async def chat_completions(request: Request):
     auth_header = request.headers.get("authorization")
     quality_on = config.check_policy is not None
     want_stream = bool(body.get("stream"))
+    # Identifica la RUN: header esplicito se il client lo manda, altrimenti
+    # dedotta dal primo system+user della conversazione (vedi RunTracker).
+    run_id = RunTracker.identify(request.headers.get("x-spendguard-run"),
+                                 body.get("messages", []))
 
     # --- DIFESA 1: STATEFUL LOOP DETECTION -------------------------------
-    # Costa zero e non tocca il provider: va per prima. Se l'agente ripete lo
-    # stesso identico prompt, il loop viene spezzato qui, a spesa nulla.
+    # Costa zero e non tocca il provider: va per prima. Riconosce l'agente che
+    # ripete la stessa MOSSA, anche quando riformula le parole (vedi LoopDetector).
     shadow_hit = None      # ('kind', 'motivo') se in shadow avremmo bloccato
     if loop_detector.enabled:
         ident = LoopDetector.identity(auth_header)
-        fp = LoopDetector.fingerprint(model, body.get("messages", []))
-        verdict, n = loop_detector.observe(ident, fp)
+        sig = LoopDetector.signature(model, body.get("messages", []))
+        verdict, n, why = loop_detector.observe(ident, sig)
         if verdict in ("trip", "block"):
-            msg = ("Agent Loop Detected: Identical prompt submitted " + str(n)
-                   + " times. Circuit broken to prevent budget burn.")
+            msg = ("Agent Loop Detected: same action repeated " + str(n)
+                   + " times (" + (why or "repeated request") + "). "
+                   "Circuit broken to prevent budget burn.")
             if enforcement.shadow():
                 shadow_hit = ("agent_loop", msg)
                 enforcement.record("agent_loop", msg, model)
@@ -907,17 +1194,18 @@ async def chat_completions(request: Request):
                               model=model, **enforcement.stats())
             else:
                 await publish("loop_detected" if verdict == "trip" else "loop_blocked",
-                              model=model, count=n, **budget.as_dict(),
+                              model=model, count=n, signal=why, **budget.as_dict(),
                               **_quality_stats(), **loop_detector.stats())
                 return JSONResponse(status_code=429, content={
                     "error": {"type": "agent_loop_detected",
                               "code": "agent_loop_detected", "message": msg},
-                    "x_spendguard": {"identical_prompts": n,
+                    "x_spendguard": {"repeats": n, "matched_on": why,
                                      "window_seconds": loop_detector.window_s,
                                      "threshold": loop_detector.threshold,
-                                     "hint": "Send a different prompt to close the breaker."}})
+                                     "hint": ("Change the action, not just the wording, "
+                                              "to close the breaker.")}})
         elif verdict == "repeat":
-            await publish("loop_repeat", model=model, count=n,
+            await publish("loop_repeat", model=model, count=n, signal=why,
                           **loop_detector.stats())
 
     # --- DIFESA 2: breaker di qualita' gia' aperto ------------------------
@@ -945,19 +1233,16 @@ async def chat_completions(request: Request):
                         and config.consensus_model != model and has_tools)
     needs_buffer = quality_on or ((tool_firewall.active() or consensus_on) and has_tools)
     if not needs_buffer and want_stream:
-        refuse, input_tokens, input_cost, price_out, hard_cap = await _preflight(body, model)
+        refuse, input_tokens, input_cost, price_out, hard_cap = await _preflight(body, model, run_id)
         if refuse:
             await publish("refused", model=model, reason=refuse, needed_usd=input_cost,
                           **budget.as_dict())
-            msg = ("input alone exceeds the remaining budget"
-                   if refuse == "input_exceeds_budget" else "no budget left to generate a reply")
-            return JSONResponse(status_code=402, content={"error": {
-                "type": "budget_exceeded", "code": "insufficient_budget",
-                "message": "SpendGuard refused before sending: " + msg + "."}})
+            return _refuse_response(refuse, {"run_id": run_id, "scope": (
+                "run" if refuse == "run_budget_exceeded" else "session")})
 
         async def sse():
             async for item in _metered_upstream(body, model, input_cost, price_out,
-                                                hard_cap, auth_header):
+                                                hard_cap, auth_header, run_id):
                 if item["type"] == "delta":
                     ch = {"id": "chatcmpl-spendguard", "object": "chat.completion.chunk",
                           "created": _now(), "model": model,
@@ -999,7 +1284,7 @@ async def chat_completions(request: Request):
     # Modalita' bufferizzata: valida e, se serve, QUALITY-TRIGGERED FALLBACK.
     # (obbligatoria con la qualita' attiva: i token gia' inviati non si ritirano)
     # -----------------------------------------------------------------
-    primary = await _attempt(body, model, auth_header) if not consensus_on else None
+    primary = await _attempt(body, model, auth_header, run_id) if not consensus_on else None
     second = None
     if consensus_on:
         # DIFESA 5: CONSENSUS FIREWALL — le due chiamate partono INSIEME, quindi
@@ -1007,14 +1292,20 @@ async def chat_completions(request: Request):
         await publish("consensus_start", model=model,
                       consensus_model=config.consensus_model)
         primary, second = await asyncio.gather(
-            _attempt(body, model, auth_header),
-            _attempt(body, config.consensus_model, auth_header))
+            _attempt(body, model, auth_header, run_id),
+            _attempt(body, config.consensus_model, auth_header, run_id))
 
     if primary["status"] != 200:
-        err_type = "budget_exceeded" if primary["status"] == 402 else "upstream_error"
-        code = "insufficient_budget" if primary["status"] == 402 else "upstream_error"
+        if primary["status"] == 402:
+            refuse_kind = primary.get("refuse", "input_exceeds_budget")
+            return _refuse_response(refuse_kind, {
+                "run_id": run_id,
+                "scope": "run" if refuse_kind == "run_budget_exceeded" else "session",
+                "run_spent_usd": round(run_tracker.spent(run_id), 6),
+                "per_run_limit_usd": run_tracker.per_run_limit})
         return JSONResponse(status_code=primary["status"], content={"error": {
-            "type": err_type, "code": code, "message": primary["error"]}})
+            "type": "upstream_error", "code": "upstream_error",
+            "message": primary["error"]}})
 
     # --- DIFESA 4: TOOL-CALL ACTION FIREWALL -----------------------------
     # L'LLM ha chiesto un'azione vietata: la risposta pericolosa viene scartata
@@ -1182,6 +1473,7 @@ async def stats():
     d = budget.as_dict()
     d.update(_quality_stats())
     d.update(loop_detector.stats())
+    d.update(run_tracker.stats())
     d.update(tool_firewall.stats())
     d.update(enforcement.stats())
     d.update(config.public())
@@ -1237,6 +1529,20 @@ async def set_config(request: Request):
         tool_firewall.configure(blocked=_as_list(data.get("blocked_tools")),
                                 allowed=_as_list(data.get("allowed_tools")),
                                 mode=data.get("tool_firewall_mode"))
+    if "per_run_budget_usd" in data:
+        v = data.get("per_run_budget_usd")
+        if v in (None, "", 0):
+            run_tracker.per_run_limit = None
+        else:
+            try:
+                run_tracker.per_run_limit = max(0.000001, float(v))
+            except Exception:
+                pass
+    if data.get("loop_fuzzy_threshold") is not None:
+        try:
+            loop_detector.fuzzy_threshold = min(1.0, max(0.5, float(data["loop_fuzzy_threshold"])))
+        except Exception:
+            pass
     if data.get("loop_detection") is not None:
         loop_detector.enabled = bool(data["loop_detection"])
     if data.get("loop_threshold") is not None:
@@ -1292,6 +1598,7 @@ async def events():
     async def gen():
         yield "data: " + json.dumps({"kind": "stats", **budget.as_dict(),
                                      **_quality_stats(), **loop_detector.stats(),
+                                     **run_tracker.stats(),
                                      **tool_firewall.stats(), **enforcement.stats(),
                                      **config.public()}) + "\n\n"
         try:

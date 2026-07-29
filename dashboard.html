@@ -226,8 +226,13 @@
         <input id="apikey" type="password" placeholder="paste your provider key">
       </div>
       <div class="f">
-        <label for="budget">Budget (USD)</label>
+        <label for="budget">Session budget (USD)</label>
         <input id="budget" type="number" min="0.0001" step="0.001" value="0.02">
+      </div>
+      <div class="f">
+        <label for="runBudget">Per-run budget (USD)</label>
+        <input id="runBudget" type="number" min="0" step="0.001" placeholder="empty = off">
+        <span class="hint">A ceiling for each single run, separate from the session budget. Without it, one bad run eats the whole day and everything after it fails for an unrelated reason.</span>
       </div>
       <div class="f full"><span class="hint">Your key stays in this local app's memory, is forwarded to the provider, and is never written to disk.</span></div>
     </div>
@@ -316,6 +321,7 @@
       <span class="pill hot">refused <b id="mRefused">0</b></span>
       <span class="pill hot">halted <b id="mHalted">0</b></span>
       <span class="pill warnp">loops <b id="mLoops">0</b></span>
+      <span class="pill hot">runs stopped <b id="mRuns">0</b></span>
       <span class="pill warnp">bad output <b id="mQFails">0</b></span>
       <span class="pill good">rescued <b id="mSaves">0</b></span>
       <span class="pill hot">actions blocked <b id="mTools">0</b></span>
@@ -389,6 +395,7 @@
     if(pol===undefined){alert("The JSON schema isn't valid JSON.");return;}
     var p={provider:$("provider").value,model:$("model").value.trim(),
       budget_usd:parseFloat($("budget").value),check_policy:pol,trip_after:2,
+      per_run_budget_usd:($("runBudget").value.trim()===""?null:parseFloat($("runBudget").value)),
       enforcement_mode:mode,
       loop_detection:$("swLoop").checked,loop_threshold:parseInt($("loopThreshold").value,10),
       blocked_tools:$("swTools").checked?$("blockedTools").value.trim():"",
@@ -436,7 +443,7 @@
     $("amount").textContent="$0.0000";gauge(0,curLimit);
     $("state").classList.remove("tripped");$("stateText").textContent="Armed";
     $("stamp").classList.remove("show");$("banner").className="banner";
-    ["mCalls","mRefused","mHalted","mLoops","mQFails","mSaves","mTools","shWould"].forEach(function(i){$(i).textContent="0";});
+    ["mCalls","mRefused","mHalted","mLoops","mRuns","mQFails","mSaves","mTools","shWould"].forEach(function(i){$(i).textContent="0";});
   }
   function banner(kind,title,html){
     $("banner").className="banner show"+(kind?" "+kind:"");
@@ -452,6 +459,7 @@
       case "stats":
         metrics(d);$("amount").textContent=fmt(d.spent_usd||0);gauge(d.spent_usd||0,lim);
         if(d.limit_usd)$("budget").value=d.limit_usd;
+        if(d.per_run_limit_usd!=null)$("runBudget").value=d.per_run_limit_usd;
         if(d.model)$("model").value=d.model;
         if(d.upstream){$("upstreamLbl").textContent=d.upstream.replace(/^https?:\/\//,"");
           $("setupSum").textContent=(d.model||"")+" · "+d.upstream.replace(/^https?:\/\//,"");}
@@ -473,8 +481,8 @@
       case "halt": gauge(lim,lim);row("kill","&#9632;","kill-switch &mdash; stream cut at "+d.output_tokens+" tok","capped");
         metrics(d);trip("Tripped");break;
       case "refused": row("kill","&#9940;","402 &mdash; refused before sending","0 tok");metrics(d);trip("Tripped");break;
-      case "loop_repeat": row("warn","&#8635;","identical prompt ("+d.count+"/"+d.loop_threshold+")","");break;
-      case "loop_detected": row("kill","&#9632;","429 &mdash; loop detected, identical prompt x"+d.count,"$0.0000");
+      case "loop_repeat": row("warn","&#8635;","same move repeated ("+d.count+"/"+d.loop_threshold+") &mdash; "+esc(d.signal||""),"");break;
+      case "loop_detected": row("kill","&#9632;","429 &mdash; loop detected x"+d.count+" ("+esc(d.signal||"repeat")+")","$0.0000");
         metrics(d);trip("Loop broken");break;
       case "loop_blocked": row("kill","&#9940;","429 &mdash; loop breaker open","0 tok");metrics(d);break;
       case "quality_fail": row("warn","&#9888;","output failed check &mdash; "+esc(d.reason),"fail "+d.fails);metrics(d);break;
